@@ -6,6 +6,13 @@
 <title>WGC Field Register</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Roboto+Slab:wght@500;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#26362B">
+<link rel="apple-touch-icon" href="icon-180.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="WGC">
 <style>
   :root{
     --bg:#E7E1CA;
@@ -197,6 +204,7 @@
   .map-overlay{position:fixed;inset:0;background:rgba(24,32,24,0.88);z-index:100;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:18px;cursor:zoom-out;}
   .map-overlay img{max-width:100%;max-height:78vh;border-radius:10px;background:#fff;box-shadow:0 8px 30px rgba(0,0,0,0.5);}
   .map-overlay .map-title{font-family:'Roboto Slab',serif;color:#F4F0E1;font-size:18px;font-weight:700;margin-bottom:10px;letter-spacing:0.03em;}
+  .offline-banner{background:var(--oxblood);color:#fff;border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:12px;cursor:pointer;box-shadow:var(--shadow);}
   .map-overlay .map-scroll{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:10px;}
   .map-overlay img.wide{max-width:none;height:min(70vh,520px);width:auto;}
 </style>
@@ -329,7 +337,11 @@ async function sbootstrap(){
   return out;
 }
 async function sset(key, val){
-  const r = await apiCall("set", {key, value: JSON.stringify(val)});
+  const payload = {key, value: JSON.stringify(val)};
+  // Config keys are PIN-protected on the backend; sessions stay open so
+  // members can register and log bags without the PIN.
+  if(/^(roster|properties|species|admin-pin|session-index)$/.test(key)) payload.pin = state.adminPin || "";
+  const r = await apiCall("set", payload);
   const ok = !!(r && r.ok);
   if(!ok){
     toast("⚠️ Couldn't save — this change did NOT reach the shared database. Check your connection and try again.", 4500);
@@ -472,15 +484,25 @@ document.addEventListener("click", (e)=>{
 
 // ---------- init / seeding ----------
 async function init(){
-  const core = await sbootstrap();
+  let core = await sbootstrap();
 
   if(core === null){
-    // Genuine failure to reach the backend. Do NOT seed/write any defaults —
-    // that would overwrite real data on the sheet. Show a retry state instead.
-    state.loaded = false;
-    state.loadFailed = true;
-    render();
-    return;
+    // Couldn't reach the backend. Fall back to the last successful load so
+    // the register still opens in the field (read-only); otherwise show the
+    // retry screen. Never seed/write defaults on a failed load.
+    const cached = readBootstrapCache();
+    if(cached){
+      core = cached;
+      state.offlineMode = true;
+    } else {
+      state.loaded = false;
+      state.loadFailed = true;
+      render();
+      return;
+    }
+  } else {
+    state.offlineMode = false;
+    saveBootstrapCache(core);
   }
   state.loadFailed = false;
 
@@ -594,6 +616,9 @@ function render(){
   else if(state.tab === "results") view.innerHTML = renderResults();
   else if(state.tab === "dashboard") view.innerHTML = renderDashboard();
   else if(state.tab === "setup") view.innerHTML = state.adminUnlocked ? renderSetup() : renderPinGate("setup");
+  if(state.offlineMode){
+    view.insertAdjacentHTML("afterbegin", `<div class="offline-banner">\u{1F4E1} Offline — showing the last synced data. Changes can't be saved right now. Tap here to retry.</div>`);
+  }
   attachHandlers();
 }
 
@@ -1249,159 +1274,308 @@ function exportCsv(){
   URL.revokeObjectURL(url);
 }
 
-// ---------- DASHBOARD TAB ----------
-function computeSeasonStats(){
-  const lockedSessions = sessionsSorted().filter(s=>s.locked);
-  const byProperty = {};
-  const bySpecies = {};
-  const byShooter = {};
-  lockedSessions.forEach(s=>{
-    const bags = s.bags || {};
-    const assignments = s.assignments || {};
-    const notShooting = s.notShooting || {};
-    Object.entries(bags).forEach(([name, counts])=>{
-      if(notShooting[name]) return; // did not shoot — excluded from stats entirely
-      const total = bagTotal(counts);
-      if(total<=0) return;
-      byShooter[name] = (byShooter[name]||0) + total;
-      const propName = assignments[name] ? assignments[name].property : "Unassigned";
-      if(!byProperty[propName]) byProperty[propName] = {total:0, species:{}};
-      byProperty[propName].total += total;
-      Object.entries(counts).forEach(([sp,n])=>{
+// ---------- DASHBOARD TAB — Stats Explorer (v2) ----------
+// Historic shot reports (none loaded yet for Wanderers — the club's past
+// seasons can be appended here later). Format per record:
+// [dateISO, day, weekendLabel, shooter, property, stand, baldpate, whitewing, peadove, didNotShoot, estimated]
+// estimated=1 marks 2024 records whose bag counts were never recorded in the
+// workbook — they carry the historical average for that property/stand instead.
+// Live results logged in this app are layered on top automatically — where the
+// same shooter/session exists in both, the app's logged bag takes precedence.
+const HISTORIC_STATS = [];
+
+function normSpecies(sp){
+  sp = String(sp).toUpperCase().trim();
+  if(sp === "PEA DOVE") return "PALOMA"; // workbook "Pea Dove" column = app species PALOMA
+  return sp;
+}
+function allStatRecords(){
+  // The workbook can legitimately hold the same shooter twice in one session
+  // (two stands, or several guests under one label), so records are kept as a
+  // list — never collapsed by key. A key is only used to let a bag logged in
+  // the app REPLACE the matching workbook row(s) for that shooter/session.
+  const histKeys = {};
+  HISTORIC_STATS.forEach(r=>{ histKeys[`${r[0]}|${r[1]}|${r[3]}`] = true; });
+  const liveOverride = {}; // key -> [live records replacing that shooter/session]
+  const liveExtra = [];
+  sessionsSorted().filter(s=>s.locked).forEach(s=>{
+    const assignments = s.assignments||{}, bags = s.bags||{}, notShooting = s.notShooting||{};
+    (s.order||[]).forEach(name=>{
+      const key = `${s.dateISO}|${s.day}|${name}`;
+      const logged = bags[name] !== undefined || notShooting[name];
+      const counts = {};
+      Object.entries(bags[name]||{}).forEach(([sp,n])=>{
         n = Number(n)||0;
-        if(n<=0) return;
-        byProperty[propName].species[sp] = (byProperty[propName].species[sp]||0) + n;
-        bySpecies[sp] = (bySpecies[sp]||0) + n;
+        if(n>0){ const k = normSpecies(sp); counts[k] = (counts[k]||0)+n; }
       });
+      const a = assignments[name];
+      const rec = {date:s.dateISO, day:s.day, wk:s.weekendLabel, shooter:name, prop:a?a.property:"", stand:a?String(a.stand):"", counts, dns:!!notShooting[name], src:"live"};
+      if(histKeys[key]){
+        if(logged) (liveOverride[key] = liveOverride[key]||[]).push(rec);
+        // not logged in the app — the workbook record stands
+      } else {
+        liveExtra.push(rec);
+      }
     });
   });
-  const sessionLog = lockedSessions.map(s=>{
-    const bags = s.bags || {};
-    const notShooting = s.notShooting || {};
-    let total = 0;
-    Object.entries(bags).forEach(([name,counts]) => { if(!notShooting[name]) total += bagTotal(counts); });
-    return {id: s.id, weekendLabel: s.weekendLabel, day: s.day, dateISO: s.dateISO, total, weather: s.weather || null};
+  const out = [];
+  const emitted = {};
+  HISTORIC_STATS.forEach(r=>{
+    const key = `${r[0]}|${r[1]}|${r[3]}`;
+    if(liveOverride[key]){
+      if(!emitted[key]){ liveOverride[key].forEach(x=>out.push(x)); emitted[key] = true; }
+      return;
+    }
+    const counts = {};
+    if(r[6]) counts["BALDPATE"] = r[6];
+    if(r[7]) counts["WHITE WING"] = r[7];
+    if(r[8]) counts["PALOMA"] = r[8];
+    out.push({date:r[0], day:r[1], wk:r[2], shooter:r[3], prop:r[4], stand:String(r[5]||""), counts, dns:!!r[9], est:!!r[10], src:"hist"});
   });
-  return {lockedSessions, byProperty, bySpecies, byShooter, sessionLog};
+  return out.concat(liveExtra);
+}
+function recTotal(r){ return Object.values(r.counts).reduce((a,b)=>a+b,0); }
+function recYear(r){ return r.date.slice(0,4); }
+
+function statsDefaults(){
+  const recs = allStatRecords().filter(r=>!r.dns);
+  if(recs.length===0) return {year:"ALL", wk:"ALL", prop:"ALL", stand:"ALL", shooter:"ALL"};
+  const latest = recs.reduce((a,b)=> a.date>b.date ? a : b);
+  return {year: recYear(latest), wk: latest.wk, prop:"ALL", stand:"ALL", shooter:"ALL"};
+}
+function filteredStats(){
+  const f = state.statsFilter;
+  return allStatRecords().filter(r=>{
+    if(r.dns) return false;
+    if(f.year!=="ALL" && recYear(r)!==f.year) return false;
+    if(f.wk!=="ALL" && r.wk!==f.wk) return false;
+    if(f.prop!=="ALL" && r.prop!==f.prop) return false;
+    if(f.stand!=="ALL" && String(r.stand)!==f.stand) return false;
+    if(f.shooter!=="ALL" && r.shooter!==f.shooter) return false;
+    return true;
+  });
+}
+
+function statBarListHtml(entries, unit){
+  // entries: [[label, value]] sorted desc
+  const max = entries.length ? entries[0][1] : 0;
+  return entries.map(([name,val])=>{
+    const pct = max>0 ? Math.round(val/max*100) : 0;
+    return `<div style="margin-bottom:10px">
+      <div class="row" style="margin-bottom:3px"><b style="flex:1;font-size:13px">${esc(String(name))}</b><span class="muted" style="flex:0 0 auto">${val}${unit||""}</span></div>
+      <div style="background:var(--bg);border-radius:6px;overflow:hidden;height:9px;">
+        <div style="background:var(--brass);width:${pct}%;height:100%;"></div>
+      </div>
+    </div>`;
+  }).join("");
+}
+function svgColumnsHtml(pairs){
+  if(pairs.length===0) return "";
+  const W=560, H=190, pad=16;
+  const step = (W-pad*2)/pairs.length;
+  const bw = Math.min(70, step*0.62);
+  const max = Math.max(1, ...pairs.map(p=>p[1]));
+  const skip = pairs.length > 12 ? Math.ceil(pairs.length/12) : 1;
+  let out = "";
+  pairs.forEach(([lab,val],i)=>{
+    const h = Math.round((H-64)*val/max);
+    const x = pad + step*i + (step-bw)/2;
+    const y = H-36-h;
+    out += `<rect x="${x.toFixed(1)}" y="${y}" width="${bw.toFixed(1)}" height="${Math.max(h,2)}" rx="3" fill="#B08D57"/>`;
+    if(pairs.length<=14) out += `<text x="${(x+bw/2).toFixed(1)}" y="${y-6}" text-anchor="middle" font-size="12" font-weight="600" fill="#26362B" font-family="Inter,sans-serif">${val}</text>`;
+    if(i % skip === 0) out += `<text x="${(x+bw/2).toFixed(1)}" y="${H-16}" text-anchor="middle" font-size="11" fill="#5B5E4F" font-family="Inter,sans-serif">${esc(String(lab))}</text>`;
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block" role="img">${out}</svg>`;
+}
+function fmtDateY(iso){
+  if(!iso) return "";
+  const d = new Date(iso+"T12:00:00");
+  return d.toLocaleDateString(undefined, {weekday:"short", month:"short", day:"numeric", year:"numeric"});
+}
+function wkSortKey(recs){
+  // weekend label -> earliest date, for chronological ordering
+  const m = {};
+  recs.forEach(r=>{ if(!(r.wk in m) || r.date < m[r.wk]) m[r.wk] = r.date; });
+  return m;
 }
 
 function renderDashboard(){
-  const stats = computeSeasonStats();
-  const hasData = Object.keys(stats.byProperty).length > 0;
+  if(!state.statsFilter) state.statsFilter = statsDefaults();
+  const f = state.statsFilter;
+  const all = allStatRecords().filter(r=>!r.dns);
 
-  const propEntries = Object.entries(stats.byProperty).sort((a,b)=>b[1].total-a[1].total);
-  const maxPropTotal = propEntries.length ? propEntries[0][1].total : 0;
-  const propBars = propEntries.map(([name,data])=>{
-    const pct = maxPropTotal>0 ? Math.round(data.total/maxPropTotal*100) : 0;
-    const breakdown = Object.entries(data.species).sort((a,b)=>b[1]-a[1]).map(([sp,n])=>`${sp} ${n}`).join(' · ');
-    return `<div style="margin-bottom:12px">
-      <div class="row" style="margin-bottom:4px"><b style="flex:1">${esc(name)}</b><span class="muted" style="flex:0 0 auto">${data.total}</span></div>
-      <div style="background:var(--bg);border-radius:6px;overflow:hidden;height:10px;">
-        <div style="background:var(--brass);width:${pct}%;height:100%;"></div>
-      </div>
-      <div class="muted" style="font-size:11px;margin-top:3px">${esc(breakdown)}</div>
-    </div>`;
-  }).join("");
+  // ---- filter option pools (scoped progressively) ----
+  const years = Array.from(new Set(all.map(recYear))).sort().reverse();
+  const inYear = all.filter(r=> f.year==="ALL" || recYear(r)===f.year);
+  const wkKeys = wkSortKey(inYear);
+  const weekends = Array.from(new Set(inYear.map(r=>r.wk))).sort((a,b)=> (wkKeys[a]||"").localeCompare(wkKeys[b]||""));
+  const inWk = inYear.filter(r=> f.wk==="ALL" || r.wk===f.wk);
+  const props = Array.from(new Set(inWk.map(r=>r.prop).filter(Boolean))).sort();
+  const inProp = inWk.filter(r=> f.prop==="ALL" || r.prop===f.prop);
+  const stands = f.prop==="ALL" ? [] : Array.from(new Set(inProp.map(r=>String(r.stand)).filter(Boolean)))
+    .sort((a,b)=> (parseInt(a,10)||999)-(parseInt(b,10)||999) || a.localeCompare(b));
+  const shooters = Array.from(new Set(inWk.map(r=>r.shooter))).sort();
 
-  const speciesEntries = Object.entries(stats.bySpecies).sort((a,b)=>b[1]-a[1]);
-  const speciesRows = speciesEntries.map(([sp,n])=>`<div class="list-row"><span>${esc(sp)}</span><span><b>${n}</b></span></div>`).join("");
+  const opt = (val, cur, label) => `<option value="${escAttr(val)}" ${val===cur?"selected":""}>${esc(label!==undefined?label:val)}</option>`;
+  const filterCard = `
+  <div class="card">
+    <h2>Stats explorer</h2>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px 10px">
+      <div><label>Year</label><select class="statsFilter" data-f="year">${opt("ALL",f.year,"All years")}${years.map(y=>opt(y,f.year)).join("")}</select></div>
+      <div><label>Weekend</label><select class="statsFilter" data-f="wk">${opt("ALL",f.wk,"All weekends")}${weekends.map(w=>opt(w,f.wk)).join("")}</select></div>
+      <div><label>Property</label><select class="statsFilter" data-f="prop">${opt("ALL",f.prop,"All properties")}${props.map(p=>opt(p,f.prop)).join("")}</select></div>
+      <div><label>Stand</label><select class="statsFilter" data-f="stand" ${f.prop==="ALL"?"disabled":""}>${opt("ALL",f.stand, f.prop==="ALL"?"Pick a property first":"All stands")}${stands.map(s=>opt(s,f.stand)).join("")}</select></div>
+    </div>
+    <label>Shooter</label>
+    <select class="statsFilter" data-f="shooter">${opt("ALL",f.shooter,"All shooters")}${shooters.map(s=>opt(s,f.shooter)).join("")}</select>
+    <div class="btn-row">
+      <button class="btn-ghost btn-small" id="statsLatest">Latest weekend</button>
+      <button class="btn-ghost btn-small" id="statsReset">All-time view</button>
+    </div>
+  </div>`;
 
-  const shooterEntries = Object.entries(stats.byShooter).sort((a,b)=>b[1]-a[1]).slice(0,10);
-  const shooterRows = shooterEntries.map(([name,n],i)=>`<div class="list-row"><span>${i+1}. ${esc(name)}</span><span><b>${n}</b></span></div>`).join("");
+  const recs = filteredStats();
+  const withBirds = recs.filter(r=>recTotal(r)>0);
+  const total = withBirds.reduce((a,r)=>a+recTotal(r),0);
+  const uniqShooters = new Set(recs.map(r=>r.shooter)).size;
+  const sessions = new Set(recs.map(r=>`${r.date}|${r.day}`)).size;
+  const best = withBirds.filter(r=>!r.est).slice().sort((a,b)=>recTotal(b)-recTotal(a))[0];
+  const hasEst = recs.some(r=>r.est);
 
-  const seasonTotal = Object.values(stats.bySpecies).reduce((a,b)=>a+b,0);
-
-  const lockedSessions = stats.lockedSessions;
-  let shootSection = `<div class="empty">No locked shoots yet.</div>`;
-  if(lockedSessions.length>0){
-    const sel = state.dashboardSessionId && state.sessions[state.dashboardSessionId] && state.sessions[state.dashboardSessionId].locked
-      ? state.sessions[state.dashboardSessionId] : lockedSessions[lockedSessions.length-1];
-    state.dashboardSessionId = sel.id;
-    const options = lockedSessions.map(s=>`<option value="${s.id}" ${s.id===sel.id?"selected":""}>${dayLabel(s.day)} · ${s.weekendLabel} · ${fmtDate(s.dateISO)}</option>`).join("");
-
-    const byProp = {};
-    const bags = sel.bags || {};
-    const assignments = sel.assignments || {};
-    const notShooting = sel.notShooting || {};
-    Object.entries(bags).forEach(([name,counts])=>{
-      if(notShooting[name]) return; // did not shoot — excluded from stats entirely
-      const total = bagTotal(counts);
-      if(total<=0) return;
-      const propName = assignments[name] ? assignments[name].property : "Unassigned";
-      byProp[propName] = (byProp[propName]||0) + total;
-    });
-    const shootTotal = Object.values(byProp).reduce((a,b)=>a+b,0);
-    const propList = Object.entries(byProp).sort((a,b)=>b[1]-a[1])
-      .map(([name,n])=>`<div class="list-row"><span>${esc(name)}</span><span><b>${n}</b></span></div>`).join("");
-
-    shootSection = `
-      <select id="dashboardSessionSel">${options}</select>
-      <div class="stat-box" style="margin-top:10px"><div class="s"><div class="n">${shootTotal}</div><div class="l">Total birds</div></div></div>
-      ${propList || `<div class="empty">No bag counts logged for this shoot yet.</div>`}
-    `;
+  if(recs.length===0){
+    return filterCard + `<div class="card"><div class="empty">No shot reports match this selection.<br>Widen the filters above.</div></div>`;
   }
 
-  return `
-  <div class="card">
-    <h2>This shoot</h2>
-    ${shootSection}
-  </div>
+  const bySpecies = {};
+  withBirds.forEach(r=>Object.entries(r.counts).forEach(([sp,n])=>{ bySpecies[sp]=(bySpecies[sp]||0)+n; }));
+  const speciesRows = Object.entries(bySpecies).sort((a,b)=>b[1]-a[1])
+    .map(([sp,n])=>`<div class="list-row"><span>${esc(sp)}</span><span><b>${n}</b></span></div>`).join("");
 
+  const summaryCard = `
   <div class="card">
-    <h2>Top locations — season to date</h2>
-    ${hasData ? `
-      <div class="stat-box"><div class="s"><div class="n">${seasonTotal}</div><div class="l">Total birds</div></div><div class="s"><div class="n">${lockedSessions.length}</div><div class="l">Shoots logged</div></div></div>
-      ${propBars}
-    ` : `<div class="empty">No bag counts logged yet this season.</div>`}
-  </div>
+    <h2>${f.wk!=="ALL" ? esc(f.wk)+" · " : ""}${f.year!=="ALL" ? esc(f.year) : "All seasons"}${f.prop!=="ALL" ? " · "+esc(f.prop) : ""}${f.stand!=="ALL" ? " · Stand "+esc(f.stand) : ""}${f.shooter!=="ALL" ? " · "+esc(f.shooter) : ""}</h2>
+    <div class="stat-box">
+      <div class="s"><div class="n">${hasEst?"~":""}${total}</div><div class="l">Birds</div></div>
+      <div class="s"><div class="n">${uniqShooters}</div><div class="l">Shooters</div></div>
+      <div class="s"><div class="n">${sessions}</div><div class="l">Sessions</div></div>
+    </div>
+    ${best ? `<p class="muted" style="margin:8px 0 0">Best single bag: <b>${esc(best.shooter)}</b> — ${recTotal(best)} birds${best.prop?` at ${esc(best.prop)}${best.stand?` · Stand ${esc(best.stand)}`:""}`:""} (${fmtDate(best.date)})</p>` : ""}
+    ${speciesRows ? `<div class="section-divider">By species</div>${speciesRows}` : ""}
+    ${hasEst ? `<p class="muted" style="margin:10px 0 0;font-size:12px">~ Includes 2024 estimates: bag counts weren't recorded that season, so each 2024 entry carries the historical average for its property &amp; stand — a rough indicator, not actuals.</p>` : ""}
+  </div>`;
 
-  ${speciesEntries.length>0 ? `
-  <div class="card">
-    <h2>By species — season to date</h2>
-    ${speciesRows}
-  </div>` : ""}
+  // ---- trend chart: adapts to the zoom level ----
+  let trendTitle, trendPairs;
+  if(f.year==="ALL"){
+    trendTitle = "Birds by year";
+    const byYear = {};
+    withBirds.forEach(r=>{ byYear[recYear(r)]=(byYear[recYear(r)]||0)+recTotal(r); });
+    trendPairs = Object.entries(byYear).sort((a,b)=>a[0].localeCompare(b[0]));
+  } else if(f.wk==="ALL"){
+    trendTitle = `Birds by weekend — ${f.year}`;
+    const byWk = {};
+    withBirds.forEach(r=>{ byWk[r.wk]=(byWk[r.wk]||0)+recTotal(r); });
+    const keys = wkSortKey(withBirds);
+    trendPairs = Object.entries(byWk).sort((a,b)=> (keys[a[0]]||"").localeCompare(keys[b[0]]||""))
+      .map(([w,n])=>[w.replace(/\s/g,""), n]);
+  } else {
+    trendTitle = `Birds by session — ${f.wk}`;
+    const byDay = {};
+    withBirds.forEach(r=>{ byDay[r.day]=(byDay[r.day]||0)+recTotal(r); });
+    const order = ["SATAM","SATPM","SUNAM","SUNPM"];
+    trendPairs = order.filter(d=>byDay[d]).map(d=>[dayLabel(d), byDay[d]]);
+  }
+  const trendCard = trendPairs.length>1 ? `<div class="card"><h2>${trendTitle}</h2>${svgColumnsHtml(trendPairs)}</div>` : "";
 
-  ${shooterEntries.length>0 ? `
-  <div class="card">
-    <h2>Top shooters — season to date</h2>
-    ${shooterRows}
-  </div>` : ""}
+  // ---- breakdown: by property, or by stand once a property is chosen ----
+  let breakdownCard = "";
+  if(f.prop==="ALL"){
+    const byProp = {};
+    withBirds.forEach(r=>{ const p=r.prop||"(no stand recorded)"; byProp[p]=(byProp[p]||0)+recTotal(r); });
+    const entries = Object.entries(byProp).sort((a,b)=>b[1]-a[1]);
+    if(entries.length) breakdownCard = `<div class="card"><h2>Top properties</h2>${statBarListHtml(entries)}</div>`;
+  } else {
+    const bySt = {};
+    withBirds.forEach(r=>{ const s=r.stand||"?"; bySt[s]=(bySt[s]||0)+recTotal(r); });
+    const entries = Object.entries(bySt).sort((a,b)=>b[1]-a[1]).map(([s,n])=>["Stand "+s, n]);
+    if(entries.length) breakdownCard = `<div class="card"><h2>Stands at ${esc(f.prop)}</h2>${statBarListHtml(entries)}${PROPERTY_MAPS[f.prop] ? propertyMapsRowHtml([f.prop]) : ""}</div>`;
+  }
 
-  ${stats.sessionLog.length>0 ? `
-  <div class="card">
-    <h2>Season log — every weekend</h2>
-    <table>
-      <thead><tr><th>Date</th><th>Session</th><th>Weather</th><th>Birds</th></tr></thead>
-      <tbody>${stats.sessionLog.slice().reverse().map(s=>
-        `<tr><td>${fmtDate(s.dateISO)}</td><td>${dayLabel(s.day)} · ${s.weekendLabel}</td><td>${s.weather ? `${weatherIcon(s.weather.code)} ${s.weather.tMax}°C` : `<span class="muted">—</span>`}</td><td><b>${s.total}</b></td></tr>`
-      ).join("")}</tbody>
-    </table>
-    <div class="btn-row"><button class="btn-ghost" id="exportSeasonCsv" style="width:100%">Export full season CSV</button></div>
-  </div>` : ""}`;
+  // ---- shooters: leaderboard, or one shooter's session log ----
+  let shooterCard = "";
+  if(f.shooter==="ALL"){
+    const bySh = {};
+    withBirds.forEach(r=>{ bySh[r.shooter]=(bySh[r.shooter]||0)+recTotal(r); });
+    const entries = Object.entries(bySh).sort((a,b)=>b[1]-a[1]).slice(0,15);
+    if(entries.length) shooterCard = `<div class="card"><h2>Top shooters</h2>${statBarListHtml(entries)}</div>`;
+  } else {
+    const rows = recs.slice().sort((a,b)=> b.date.localeCompare(a.date) || a.day.localeCompare(b.day))
+      .map(r=>`<tr><td style="white-space:nowrap">${fmtDateY(r.date)}</td><td>${dayLabel(r.day)} · ${esc(r.wk)}</td><td>${esc(r.prop||"—")}${r.stand?` · ${esc(r.stand)}`:""}</td><td><b>${r.est?"~":""}${recTotal(r)||"—"}</b></td></tr>`).join("");
+    shooterCard = `<div class="card"><h2>${esc(f.shooter)} — session log</h2>
+      <table><thead><tr><th>Date</th><th>Session</th><th>Property · Stand</th><th>Birds</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  }
+
+  // ---- season log: one row per session in the current selection ----
+  const sessMap = {};
+  recs.forEach(r=>{
+    const k = `${r.date}|${r.day}`;
+    if(!sessMap[k]) sessMap[k] = {date:r.date, day:r.day, wk:r.wk, shooters:0, birds:0, est:false};
+    sessMap[k].shooters += 1;
+    sessMap[k].birds += recTotal(r);
+    if(r.est) sessMap[k].est = true;
+  });
+  const sessList = Object.values(sessMap).sort((a,b)=> b.date.localeCompare(a.date) || b.day.localeCompare(a.day));
+  const LOG_CAP = 30;
+  const shownSess = sessList.slice(0, LOG_CAP);
+  const liveWeather = {};
+  sessionsSorted().forEach(s=>{ if(s.weather) liveWeather[`${s.dateISO}|${s.day}`] = s.weather; });
+  const logRows = shownSess.map(s=>{
+    const w = liveWeather[`${s.date}|${s.day}`];
+    const wHtml = w ? `${weatherIcon(w.code)} ${w.tMax}\u00b0C` : weatherChipHtml(s.date, s.day);
+    return `<tr><td style="white-space:nowrap">${fmtDateY(s.date)}</td><td>${dayLabel(s.day)} \u00b7 ${esc(s.wk)}</td><td>${s.shooters}</td><td style="white-space:nowrap">${wHtml}</td><td><b>${s.est?"~":""}${s.birds}</b></td></tr>`;
+  }).join("");
+  const seasonLogCard = sessList.length ? `<div class="card"><h2>Season log</h2>
+    ${sessList.length > LOG_CAP ? `<p class="muted">Most recent ${LOG_CAP} of ${sessList.length} sessions \u2014 narrow the filters above to see earlier ones.</p>` : ""}
+    <table><thead><tr><th>Date</th><th>Session</th><th>Shooters</th><th>Weather</th><th>Birds</th></tr></thead><tbody>${logRows}</tbody></table>
+  </div>` : "";
+
+  const exportCard = `<div class="card">
+    <p class="muted">Exports exactly what the filters above are showing — one row per shooter per session, live app results merged with the historic workbook (app results win where both exist).</p>
+    <div class="btn-row"><button class="btn-ghost" id="exportSeasonCsv" style="width:100%">Export filtered CSV (${recs.length} rows)</button></div>
+  </div>`;
+
+  return filterCard + summaryCard + trendCard + breakdownCard + shooterCard + seasonLogCard + exportCard;
 }
+
 function exportSeasonCsv(){
-  const stats = computeSeasonStats();
-  let csv = "Weekend,Day,Date,Order,Shooter,Property,Stand,Birds,Species Breakdown\n";
-  stats.lockedSessions.forEach(s=>{
-    const bags = s.bags || {};
-    const assignments = s.assignments || {};
-    const notShooting = s.notShooting || {};
-    (s.order||[]).forEach((name,i)=>{
-      const a = assignments[name] || {};
-      const didNotShoot = !!notShooting[name];
-      const counts = bags[name];
-      const total = didNotShoot ? "Did not shoot" : bagTotal(counts);
-      const breakdown = didNotShoot ? "" : bagBreakdown(counts).replace(/"/g,'""');
-      csv += `${s.weekendLabel},${s.day},${s.dateISO},${i+1},"${name.replace(/"/g,'""')}",${a.property||""},${a.stand||""},${total},"${breakdown}"\n`;
-    });
+  const recs = filteredStats().slice().sort((a,b)=> a.date.localeCompare(b.date) || a.day.localeCompare(b.day) || a.shooter.localeCompare(b.shooter));
+  let csv = "Date,Weekend,Session,Shooter,Property,Stand,Total,Breakdown,Source\n";
+  recs.forEach(r=>{
+    const breakdown = Object.entries(r.counts).map(([sp,n])=>`${sp} ${n}`).join(" · ");
+    csv += `${r.date},${r.wk},${dayLabel(r.day)},"${r.shooter.replace(/"/g,'""')}","${(r.prop||"").replace(/"/g,'""')}",${r.stand||""},${recTotal(r)},"${breakdown}",${r.est?"Estimated (2024 stand avg)":(r.src==="live"?"App":"Workbook")}\n`;
   });
   const blob = new Blob([csv], {type:"text/csv"});
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = url; a.download = `WGC_season_bag_log.csv`;
+  a.href = url; a.download = `WGC_stats_export.csv`;
   document.body.appendChild(a); a.click(); a.remove();
   URL.revokeObjectURL(url);
 }
+
+// stats-explorer controls (delegated — no per-render wiring needed)
+document.addEventListener("change", (e)=>{
+  const sel = e.target.closest(".statsFilter");
+  if(!sel) return;
+  const f = state.statsFilter;
+  f[sel.dataset.f] = sel.value;
+  if(sel.dataset.f === "year") f.wk = "ALL";
+  if(sel.dataset.f === "prop") f.stand = "ALL";
+  render();
+});
+document.addEventListener("click", (e)=>{
+  if(e.target.id === "statsReset"){ state.statsFilter = {year:"ALL", wk:"ALL", prop:"ALL", stand:"ALL", shooter:"ALL"}; render(); }
+  if(e.target.id === "statsLatest"){ state.statsFilter = statsDefaults(); render(); }
+});
 
 // ---------- SETUP TAB ----------
 function renderSetup(){
@@ -1609,7 +1783,7 @@ async function clearAllSessions(){
   const typed = prompt(`This will permanently delete all ${ids.length} session(s) — every registration, draw, and bag count. Roster/properties/species are untouched.\n\nType DELETE to confirm.`);
   if(typed !== "DELETE"){ toast("Cancelled — nothing deleted."); return; }
   for(const id of ids){
-    await apiCall("delete", {key: "session:"+id});
+    await apiCall("delete", {key: "session:"+id, pin: state.adminPin || ""});
     delete state.sessions[id];
   }
   state.sessionIndex = [];
@@ -1636,7 +1810,7 @@ async function deleteSession(id){
   state.sessionIndex = state.sessionIndex.filter(x=>x!==id);
   delete state.sessions[id];
   await sset("session-index", state.sessionIndex);
-  await apiCall("delete", {key: "session:"+id}); // actually remove the row, not just unlist it
+  await apiCall("delete", {key: "session:"+id, pin: state.adminPin || ""}); // actually remove the row, not just unlist it
   render();
 }
 async function toggleGuestsAllowed(id){
@@ -2023,6 +2197,39 @@ function attachHandlers(){
   const clearAllBtn = document.getElementById("clearAllSessions");
   if(clearAllBtn) clearAllBtn.addEventListener("click", clearAllSessions);
 }
+
+
+// ---------- v2: PWA, offline cache, live refresh ----------
+function saveBootstrapCache(core){ try{ localStorage.setItem("wgc-bootstrap-cache", JSON.stringify(core)); }catch(e){} }
+function readBootstrapCache(){ try{ const raw = localStorage.getItem("wgc-bootstrap-cache"); return raw ? JSON.parse(raw) : null; }catch(e){ return null; } }
+document.addEventListener("click", (e)=>{ if(e.target.closest(".offline-banner")) location.reload(); });
+
+if("serviceWorker" in navigator){
+  window.addEventListener("load", ()=>{ navigator.serviceWorker.register("sw.js").catch(()=>{}); });
+}
+
+// Live refresh: while viewing Draw or Results, quietly re-pull the selected
+// session so stand claims and bag logs appear without a manual reload.
+const LIVE_REFRESH_MS = 25000;
+async function liveRefreshTick(){
+  if(document.visibilityState !== "visible") return;
+  if(!state.loaded || state.offlineMode) return;
+  if(state.tab !== "draw" && state.tab !== "results") return;
+  const el = document.activeElement;
+  if(el && (el.tagName === "SELECT" || el.tagName === "INPUT" || el.tagName === "TEXTAREA")) return;
+  const partial = Array.from(document.querySelectorAll(".propSel,.standSel,#resultsStandProp,#resultsStandStand")).some(s=>s.value);
+  if(partial) return; // someone is mid-assignment on this screen — don't wipe their picks
+  const id = state.tab === "draw" ? state.drawSessionId : state.resultsSessionId;
+  if(!id) return;
+  const fresh = await sget("session:"+id);
+  if(!fresh) return;
+  if(JSON.stringify(fresh) !== JSON.stringify(state.sessions[id])){
+    state.sessions[id] = fresh;
+    render();
+  }
+}
+setInterval(liveRefreshTick, LIVE_REFRESH_MS);
+window.__liveRefreshTick = liveRefreshTick; // test hook
 
 init();
 </script>
