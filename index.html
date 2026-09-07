@@ -257,7 +257,7 @@ function isJuniorName(name){
   const m = state.roster.find(r=>r.name===name);
   return m ? !!m.junior : false;
 }
-const SEED_PROPERTIES = [{"name": "DALLAS", "stands": ["1", "2", "3", "4", "4A", "5", "6", "7", "8", "8A", "8B", "HILL SIDE 1", "HILL SIDE 2", "9", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24"]}, {"name": "TOP DALLAS", "stands": ["1", "2", "3", "4"]}, {"name": "PERA", "stands": ["1", "2", "3", "4", "5", "6", "7", "8"]}, {"name": "PUMPHOUSE (BELVEDERE)", "stands": ["1", "2", "3", "4", "5", "6", "7", "8", "9"]}, {"name": "MUDHOLE (SERGE ISLAND)", "stands": ["1", "2", "3", "4", "5", "6", "7", "8"]}, {"name": "KEMMISWOOD", "stands": ["1", "2", "3", "4"]}, {"name": "PALM TREE", "stands": ["1", "2", "3", "5"]}, {"name": "BIRD VALLEY (FARM)", "stands": ["1", "2", "3", "4", "5", "6", "7", "10", "12", "13", "21A TOP", "21B BOTTOM", "21C BOTTOM"]}, {"name": "JUNIOR MOUNTAIN", "stands": ["1", "2"]}];
+const SEED_PROPERTIES = [{"name": "DALLAS", "stands": ["1", "2", "3", "4", "4A", "5", "6", "7", "8", "8A", "8B", "HILL SIDE 1", "HILL SIDE 2", "METH LAB 1", "METH LAB 2", "9", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24"]}, {"name": "TOP DALLAS", "stands": ["1", "2", "3", "4"]}, {"name": "PERA", "stands": ["1", "2", "3", "4", "5", "6", "7", "8"]}, {"name": "PUMPHOUSE (BELVEDERE)", "stands": ["1", "2", "3", "4", "5", "6", "7", "8", "9"]}, {"name": "MUDHOLE (SERGE ISLAND)", "stands": ["1", "2", "3", "4", "5", "6", "7", "8"]}, {"name": "KEMMISWOOD", "stands": ["1", "2", "3", "4"]}, {"name": "PALM TREE", "stands": ["1", "2", "3", "5"]}, {"name": "BIRD VALLEY (FARM)", "stands": ["1", "2", "3", "4", "5", "6", "7", "10", "12", "13", "21A TOP", "21B BOTTOM", "21C BOTTOM"]}, {"name": "JUNIOR MOUNTAIN", "stands": ["1", "2"]}];
 const DAY_TYPES = [
   {key:"SATAM", label:"Saturday AM", dayOffset:0},
   {key:"SATPM", label:"Saturday PM", dayOffset:0},
@@ -560,6 +560,24 @@ async function init(){
     props = props.map(p=>({...p, active:true}));
     await sset("properties", props);
   }
+  // One-off migration: SEED_PROPERTIES only applies on a first-ever load, so new
+  // stands added to the seed list would never reach an existing register. This
+  // adds any missing seed stands to properties already saved, without touching
+  // stands the club has added or renamed by hand.
+  {
+    const seedByName = {};
+    SEED_PROPERTIES.forEach(sp=>{ seedByName[sp.name] = sp.stands; });
+    let changed = false;
+    props.forEach(p=>{
+      const seedStands = seedByName[p.name];
+      if(!seedStands || !Array.isArray(p.stands)) return;
+      const have = new Set(p.stands.map(String));
+      seedStands.forEach(sd=>{
+        if(!have.has(String(sd))){ p.stands.push(String(sd)); changed = true; }
+      });
+    });
+    if(changed) await sset("properties", props);
+  }
   state.properties = props;
 
   let species = core["species"];
@@ -613,6 +631,36 @@ function sessionStatus(s){
 }
 
 // ---------- bag count helpers ----------
+// ---------- move stand ----------
+// A hunter drawn to one stand sometimes walks to another mid-shoot for a better
+// bird line — often one that is already held by someone else. That is legitimate:
+// the stand simply doubles up for the session. movedTo records where they ACTUALLY
+// shot; assignments still holds the stand they were drawn to, so the draw record
+// stays honest and the original holder keeps their stand.
+function allStandsFor(prop){
+  if(!prop) return [];
+  return standList(prop);
+}
+function movedFor(sess, name){
+  const m = (sess.movedTo||{})[name];
+  return (m && m.property) ? m : null;
+}
+// Where a shooter actually stood: their move if they made one, else their draw.
+function actualStand(sess, name){
+  return movedFor(sess, name) || (sess.assignments||{})[name] || null;
+}
+// property -> stand -> [names], based on where people actually ended up.
+function occupancyMap(sess){
+  const map = {};
+  (sess.order||[]).forEach(n=>{
+    const a = actualStand(sess, n);
+    if(!a || !a.property) return;
+    const byStand = map[a.property] = map[a.property] || {};
+    const k = String(a.stand);
+    (byStand[k] = byStand[k] || []).push(n);
+  });
+  return map;
+}
 function bagTotal(counts){
   if(!counts) return 0;
   return Object.values(counts).reduce((a,b)=>a+(Number(b)||0), 0);
@@ -1132,8 +1180,12 @@ function renderResults(){
   const bags = sel.bags || {};
   const notShooting = sel.notShooting || {};
 
+  const occ = occupancyMap(sel);
   const rows = sel.order.map((name,i)=>{
-    const a = (sel.assignments||{})[name];
+    const drawn = (sel.assignments||{})[name];
+    const mv = movedFor(sel, name);
+    const a = mv || drawn;
+    const shared = a && occ[a.property] && (occ[a.property][String(a.stand)]||[]).length > 1;
     const didNotShoot = !!notShooting[name];
     const counts = bags[name];
     const total = bagTotal(counts);
@@ -1141,7 +1193,10 @@ function renderResults(){
     const birdsCell = didNotShoot
       ? `<span class="muted">Did not shoot</span>`
       : (total>0 ? `<b>${total}</b>${breakdown?`<div class="muted" style="font-size:11px">${esc(breakdown)}</div>`:""}` : `<span class="muted">—</span>`);
-    return `<tr><td>${i+1}</td><td>${esc(name)}</td><td>${a?esc(a.property):"—"}</td><td>${a?a.stand:"—"}</td>
+    const standCell = !a ? "—" : `${esc(String(a.stand))}${
+      mv ? `<div class="muted" style="font-size:11px">moved from ${drawn?esc(String(drawn.stand)):"\u2014"}</div>` : ""}${
+      shared && !mv ? `<div class="muted" style="font-size:11px">shared</div>` : ""}`;
+    return `<tr><td>${i+1}</td><td>${esc(name)}${mv?' <span class="tag tag-drawn">moved</span>':""}</td><td>${a?esc(a.property):"—"}</td><td>${standCell}</td>
       <td>${birdsCell}</td></tr>`;
   }).join("");
 
@@ -1158,6 +1213,30 @@ function renderResults(){
     </div>`).join("");
 
   const wasNotShooting = selectedBagName ? !!notShooting[selectedBagName] : false;
+
+  // --- moved to another stand ---
+  const drawnAssign = selectedBagName ? (sel.assignments||{})[selectedBagName] : null;
+  const alreadyMoved = selectedBagName ? movedFor(sel, selectedBagName) : null;
+  window.__moveOccupancy = occupancyMap(sel);
+  window.__moveSelf = selectedBagName || "";
+  window.__movePreselect = alreadyMoved ? String(alreadyMoved.stand) : "";
+  const moveAvailSet = sel.availableProperties ? new Set(sel.availableProperties) : null;
+  const movePropOpts = state.properties
+    .filter(p => p.active && (!moveAvailSet || moveAvailSet.has(p.name)))
+    .map(p=>`<option value="${escAttr(p.name)}" ${alreadyMoved && alreadyMoved.property===p.name?"selected":""}>${esc(p.name)}</option>`).join("");
+  const moveBlock = !selectedBagName ? "" : `
+    <label class="session-option" style="margin-top:12px">
+      <input type="checkbox" id="movedChk" ${alreadyMoved?"checked":""}>
+      <div class="meta">
+        <div class="sday">I moved to another stand</div>
+        <div class="sdate">${drawnAssign ? `Drawn to ${esc(drawnAssign.property)} \u00b7 Stand ${esc(String(drawnAssign.stand))}` : "No stand recorded in the draw"} \u2014 log the stand you actually shot</div>
+      </div>
+    </label>
+    <div id="moveFields" style="display:${alreadyMoved?"block":"none"}">
+      <p class="muted" style="margin:6px 0">Stands already held by someone else are still listed \u2014 pick one and the stand simply doubles up for this session. Both bags are recorded against it.</p>
+      <select id="moveProp"><option value="">Property\u2026</option>${movePropOpts}</select>
+      <select id="moveStand"><option value="">Stand\u2026</option></select>
+    </div>`;
 
   // --- Change/release stand: fully independent card, own name selection,
   // no connection to the did-not-shoot stats checkbox above. ---
@@ -1206,6 +1285,7 @@ function renderResults(){
       ${state.species.length===0 ? `<p class="muted">No species set up yet — ask the admin to add some under Setup.</p>` : `
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px">${speciesInputs}</div>
       `}
+      ${moveBlock}
     </div>
     <div class="btn-row"><button class="btn-primary" id="submitBag" style="width:100%">Save</button></div>
   </div>` : ""}
@@ -1237,6 +1317,7 @@ async function submitBag(){
   target.notShooting = target.notShooting || {};
   if(didNotShoot){
     delete target.bags[name];
+    if(target.movedTo) delete target.movedTo[name];
     target.notShooting[name] = true;
     await saveSession(target);
     toast(`Marked ${name.split(" (")[0]} as did not shoot — excluded from stats.`);
@@ -1248,6 +1329,20 @@ async function submitBag(){
       if(n && n>0) counts[inp.dataset.species] = n;
     });
     target.bags[name] = counts;
+    // Record (or clear) a mid-shoot move. Deliberately no clash check: doubling
+    // up on a stand is the whole point of this.
+    target.movedTo = target.movedTo || {};
+    const movedChk = document.getElementById("movedChk");
+    if(movedChk && movedChk.checked){
+      const mp = document.getElementById("moveProp");
+      const ms = document.getElementById("moveStand");
+      const mProp = mp ? mp.value : "";
+      const mStand = ms ? ms.value : "";
+      if(!mProp || !mStand){ toast("Pick the property and stand you moved to, or untick the box."); return; }
+      target.movedTo[name] = {property: mProp, stand: String(mStand)};
+    } else {
+      delete target.movedTo[name];
+    }
     // Stamp the actual weather for this shoot day, once, the first time anyone logs a bag
     if(!target.weather){
       const w = await fetchWeatherForSession(target.dateISO, target.day);
@@ -1330,14 +1425,16 @@ function exportCsv(){
   if(!sel) return;
   const bags = sel.bags || {};
   const notShooting = sel.notShooting || {};
-  let csv = "Order,Shooter,Property,Stand,Birds,Species Breakdown,Weekend,Day,Date\n";
+  let csv = "Order,Shooter,Property,Stand,Drawn Stand,Moved,Birds,Species Breakdown,Weekend,Day,Date\n";
   sel.order.forEach((name,i)=>{
-    const a = (sel.assignments||{})[name] || {};
+    const drawn = (sel.assignments||{})[name] || {};
+    const mv = movedFor(sel, name);
+    const a = mv || drawn;
     const didNotShoot = !!notShooting[name];
     const counts = bags[name];
     const total = didNotShoot ? "Did not shoot" : bagTotal(counts);
     const breakdown = didNotShoot ? "" : bagBreakdown(counts).replace(/"/g,'""');
-    csv += `${i+1},"${name.replace(/"/g,'""')}",${a.property||""},${a.stand||""},${total},"${breakdown}",${sel.weekendLabel},${sel.day},${sel.dateISO}\n`;
+    csv += `${i+1},"${name.replace(/"/g,'""')}",${a.property||""},${a.stand||""},${drawn.stand||""},${mv?"Yes":"No"},${total},"${breakdown}",${sel.weekendLabel},${sel.day},${sel.dateISO}\n`;
   });
   const blob = new Blob([csv], {type:"text/csv"});
   const url = URL.createObjectURL(blob);
@@ -1381,7 +1478,11 @@ function allStatRecords(){
         n = Number(n)||0;
         if(n>0){ const k = normSpecies(sp); counts[k] = (counts[k]||0)+n; }
       });
-      const a = assignments[name];
+      const drawnA = assignments[name];
+      const movedA = ((s.movedTo||{})[name] && (s.movedTo||{})[name].property) ? s.movedTo[name] : null;
+      // Birds are credited to the stand actually shot, so a doubled-up stand
+      // shows the combined bag when you filter stats by it.
+      const a = movedA || drawnA;
       const rec = {date:s.dateISO, day:s.day, wk:s.weekendLabel, shooter:name, prop:a?a.property:"", stand:a?String(a.stand):"", counts, dns:!!notShooting[name], src:"live", reported:!!logged};
       if(histKeys[key]){
         if(logged) (liveOverride[key] = liveOverride[key]||[]).push(rec);
@@ -2331,6 +2432,37 @@ function attachHandlers(){
       state.selectedBagName = bagNameSel.value;
       render();
     });
+  }
+  const movedChk = document.getElementById("movedChk");
+  if(movedChk){
+    movedChk.addEventListener("change", ()=>{
+      const f = document.getElementById("moveFields");
+      if(f) f.style.display = movedChk.checked ? "block" : "none";
+    });
+  }
+  const movePropSel = document.getElementById("moveProp");
+  if(movePropSel){
+    const fillMoveStands = ()=>{
+      const standSel = document.getElementById("moveStand");
+      if(!standSel) return;
+      const propName = movePropSel.value;
+      const prop = state.properties.find(p=>p.name===propName);
+      standSel.innerHTML = `<option value="">Stand\u2026</option>`;
+      if(!prop) return;
+      const held = (window.__moveOccupancy && window.__moveOccupancy[propName]) || {};
+      const self = window.__moveSelf || "";
+      allStandsFor(prop).forEach(sd=>{
+        const others = (held[String(sd)]||[]).filter(n=>n!==self);
+        const note = others.length ? ` \u2014 also ${others.map(n=>n.split(" (")[0]).join(", ")}` : "";
+        standSel.innerHTML += `<option value="${escAttr(String(sd))}">${esc(String(sd))}${esc(note)}</option>`;
+      });
+    };
+    movePropSel.addEventListener("change", fillMoveStands);
+    if(movePropSel.value){
+      fillMoveStands();
+      const pre = window.__movePreselect;
+      if(pre){ const ss = document.getElementById("moveStand"); if(ss) ss.value = pre; }
+    }
   }
   const didNotShootChk = document.getElementById("didNotShootChk");
   if(didNotShootChk){
