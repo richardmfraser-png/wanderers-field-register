@@ -112,6 +112,10 @@
   .btn-ghost{background:transparent;color:var(--forest);border:1px solid var(--forest);}
   .btn-danger{background:transparent;color:var(--oxblood);border:1px solid var(--oxblood);}
   .btn-small{padding:7px 10px;font-size:12px;}
+  .refresh-bar{display:flex;align-items:center;gap:10px;margin-top:10px;}
+  .refresh-bar .refresh-stamp{font-size:11.5px;flex:1;}
+  .refreshNow{flex:0 0 auto;white-space:nowrap;}
+  .refreshNow[disabled]{opacity:0.55;}
   .row{display:flex;gap:8px;align-items:center;}
   .row > *{flex:1;}
   .btn-row{display:flex;gap:8px;margin-top:12px;}
@@ -543,6 +547,7 @@ async function init(){
   // Safety net: catches anything the bootstrap response somehow missed.
   await loadAllSessions();
   state.loaded = true;
+  if(!state.offlineMode) state.lastSyncAt = Date.now();
   render();
 }
 
@@ -879,6 +884,7 @@ function renderDraw(){
   <div class="card">
     <h2>Choose session</h2>
     ${sessions.length ? `<select id="drawSessionSel">${options}</select>` : `<div class="empty">No sessions available.</div>`}
+    ${refreshBarHtml(!!sel)}
     ${pending.length ? `<div class="muted" style="margin-top:10px">${pending.length} session${pending.length>1?"s":""} waiting on roll call: ${pending.map(s=>`${dayLabel(s.day)} · ${s.weekendLabel}`).join(", ")}. Lock roll call for ${pending.length>1?"them":"it"} first.</div>` : ""}
   </div>
   <div class="card">${body}</div>`;
@@ -1174,6 +1180,7 @@ function renderResults(){
   <div class="card">
     <h2>Results <span class="muted" style="font-weight:400;font-size:13px">· ${sel.weather ? `${weatherIcon(sel.weather.code)} ${sel.weather.tMax}°C` : weatherChipHtml(sel.dateISO)}</span></h2>
     <select id="resultsSessionSel">${options}</select>
+    ${refreshBarHtml(true)}
     <div class="muted" style="margin:10px 0 4px">${isLocked?'Final — locked':'Draft — not yet locked'}</div>
     <table>
       <thead><tr><th>#</th><th>Shooter</th><th>Property</th><th>Stand</th><th>Birds</th></tr></thead>
@@ -2223,13 +2230,117 @@ async function liveRefreshTick(){
   if(!id) return;
   const fresh = await sget("session:"+id);
   if(!fresh) return;
+  markSynced();
   if(JSON.stringify(fresh) !== JSON.stringify(state.sessions[id])){
     state.sessions[id] = fresh;
     render();
+  } else {
+    updateRefreshStamps();
   }
 }
 setInterval(liveRefreshTick, LIVE_REFRESH_MS);
 window.__liveRefreshTick = liveRefreshTick; // test hook
+
+// ---------- manual refresh ----------
+// The 25-second auto-refresh covers most of it, but in the field people want to
+// know the picks in front of them are current *right now* rather than wait out
+// the timer, so Draw and Results each carry a Refresh button and a plain-English
+// stamp saying how stale the screen is.
+function markSynced(){ state.lastSyncAt = Date.now(); }
+function agoText(ts){
+  if(!ts) return "not yet updated";
+  const secs = Math.max(0, Math.round((Date.now()-ts)/1000));
+  if(secs < 10) return "updated just now";
+  if(secs < 60) return `updated ${secs}s ago`;
+  const mins = Math.round(secs/60);
+  if(mins < 60) return `updated ${mins} min ago`;
+  const hrs = Math.round(mins/60);
+  return `updated ${hrs} hr${hrs>1?"s":""} ago`;
+}
+function refreshBarHtml(hasSession){
+  if(!hasSession) return "";
+  return `<div class="refresh-bar">
+    <button class="btn-ghost btn-small refreshNow" type="button">&#8635; Refresh</button>
+    <span class="muted refresh-stamp">${state.offlineMode ? "offline \u2014 showing the last saved copy" : esc(agoText(state.lastSyncAt))}</span>
+  </div>`;
+}
+function updateRefreshStamps(){
+  const txt = state.offlineMode ? "offline \u2014 showing the last saved copy" : agoText(state.lastSyncAt);
+  document.querySelectorAll(".refresh-stamp").forEach(el=>{ el.textContent = txt; });
+}
+setInterval(updateRefreshStamps, 10000);
+
+// A half-made stand selection is the one thing a re-render would destroy, so it
+// is captured before and put back afterwards. Restoring the property fires the
+// same change event a person would, which is what repopulates the stand list.
+function snapshotPicks(){
+  const snap = {tickets:[], results:null};
+  document.querySelectorAll(".ticket[data-pending]").forEach(t=>{
+    const p = t.querySelector(".propSel"), s = t.querySelector(".standSel");
+    if(p && p.value) snap.tickets.push({name:t.getAttribute("data-pending"), prop:p.value, stand:s?s.value:""});
+  });
+  const rp = document.getElementById("resultsStandProp"), rs = document.getElementById("resultsStandStand");
+  if(rp && rp.value) snap.results = {prop:rp.value, stand:rs?rs.value:""};
+  return snap;
+}
+function restorePicks(snap){
+  if(!snap) return;
+  (snap.tickets||[]).forEach(v=>{
+    const t = Array.from(document.querySelectorAll(".ticket[data-pending]"))
+      .find(x=>x.getAttribute("data-pending") === v.name);
+    if(!t) return; // that shooter has since been assigned by someone else
+    const p = t.querySelector(".propSel");
+    if(!p) return;
+    p.value = v.prop;
+    p.dispatchEvent(new Event("change", {bubbles:true}));
+    const s = t.querySelector(".standSel");
+    if(s && v.stand && Array.from(s.options).some(o=>o.value===v.stand)) s.value = v.stand;
+  });
+  if(snap.results){
+    const rp = document.getElementById("resultsStandProp");
+    if(rp){
+      rp.value = snap.results.prop;
+      rp.dispatchEvent(new Event("change", {bubbles:true}));
+      const rs = document.getElementById("resultsStandStand");
+      if(rs && snap.results.stand && Array.from(rs.options).some(o=>o.value===snap.results.stand)) rs.value = snap.results.stand;
+    }
+  }
+}
+let refreshInFlight = false;
+async function manualRefresh(btn){
+  if(refreshInFlight) return;
+  if(state.offlineMode){ toast("You're offline \u2014 this is the last saved copy. It'll update when you're back in coverage."); return; }
+  const id = state.tab === "draw" ? state.drawSessionId : state.resultsSessionId;
+  if(!id){ toast("Pick a session first."); return; }
+  refreshInFlight = true;
+  const label = btn ? btn.innerHTML : null;
+  if(btn){ btn.disabled = true; btn.textContent = "Refreshing\u2026"; }
+  try{
+    const fresh = await sget("session:"+id);
+    if(!fresh){ toast("Couldn't reach the sheet. Try again in a moment."); return; }
+    markSynced();
+    if(JSON.stringify(fresh) === JSON.stringify(state.sessions[id])){
+      updateRefreshStamps();
+      toast("Already up to date.");
+      return;
+    }
+    const snap = snapshotPicks();
+    state.sessions[id] = fresh;
+    render();
+    restorePicks(snap);
+    toast("Refreshed \u2014 showing the latest picks.");
+  }catch(err){
+    toast("Couldn't refresh just now. Check your signal and try again.");
+  }finally{
+    refreshInFlight = false;
+    const b = document.querySelector(".refreshNow");
+    if(b){ b.disabled = false; if(label) b.innerHTML = label; }
+  }
+}
+document.addEventListener("click", (e)=>{
+  const btn = e.target.closest(".refreshNow");
+  if(btn) manualRefresh(btn);
+});
 
 init();
 </script>
