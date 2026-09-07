@@ -112,6 +112,15 @@
   .btn-ghost{background:transparent;color:var(--forest);border:1px solid var(--forest);}
   .btn-danger{background:transparent;color:var(--oxblood);border:1px solid var(--oxblood);}
   .btn-small{padding:7px 10px;font-size:12px;}
+  .scope-row{display:flex;gap:8px;margin:12px 0 2px;}
+  .scope-opt{
+    flex:1;display:flex;align-items:center;gap:7px;cursor:pointer;
+    border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:#fff;
+    font-size:12.5px;color:var(--ink-soft);
+    text-transform:none;letter-spacing:0;margin:0;font-weight:500;
+  }
+  .scope-opt.checked{border-color:var(--brass);background:#F6EFE0;color:var(--ink);font-weight:600;}
+  .scope-opt input{width:15px;height:15px;flex:0 0 auto;accent-color:#B08D57;}
   .refresh-bar{display:flex;align-items:center;gap:10px;margin-top:10px;}
   .refresh-bar .refresh-stamp{font-size:11.5px;flex:1;}
   .refreshNow{flex:0 0 auto;white-space:nowrap;}
@@ -403,6 +412,18 @@ function fmtDateTime(d){
 // dates (used when logging bag counts after a shoot) and the forecast API
 // for upcoming dates (used on the Draw page).
 const WEATHER_LAT = 17.8814, WEATHER_LON = -76.5300; // Yallahs, St Thomas — eastern Jamaica reference point
+const SESSION_WEATHER_HOUR = { SATAM: 7, SATPM: 14, SUNAM: 7 }; // approx shoot start times
+// Rough severity ranking so we can pick the "worst" (most rain-like) code
+// seen across a multi-hour window, rather than whatever's true at one instant.
+function codeSeverity(code){
+  if([95,96,99].includes(code)) return 6;                // thunderstorm
+  if([61,63,65,66,67,80,81,82].includes(code)) return 5; // rain / showers
+  if([51,53,55,56,57].includes(code)) return 4;          // drizzle
+  if(code===45||code===48) return 3;                     // fog
+  if(code===3) return 2;                                 // overcast
+  if(code===2) return 1;                                 // partly cloudy
+  return 0;                                              // clear / mostly clear
+}
 function weatherIcon(code){
   if(code===0) return "☀️";
   if(code===1) return "🌤️";
@@ -414,38 +435,52 @@ function weatherIcon(code){
   if([95,96,99].includes(code)) return "⛈️";
   return "🌡️";
 }
-async function fetchWeatherForDate(dateISO){
+async function fetchWeatherForSession(dateISO, day){
   const today = new Date(); today.setHours(0,0,0,0);
   const target = new Date(dateISO+"T12:00:00");
   const isPast = target < today;
   const base = isPast ? "https://archive-api.open-meteo.com/v1/archive" : "https://api.open-meteo.com/v1/forecast";
-  const url = `${base}?latitude=${WEATHER_LAT}&longitude=${WEATHER_LON}&daily=weathercode,temperature_2m_max&timezone=America%2FJamaica&start_date=${dateISO}&end_date=${dateISO}`;
+  const url = `${base}?latitude=${WEATHER_LAT}&longitude=${WEATHER_LON}&hourly=temperature_2m,weathercode&timezone=America%2FJamaica&start_date=${dateISO}&end_date=${dateISO}`;
   try{
     const res = await fetch(url);
     const data = await res.json();
-    if(data && data.daily && data.daily.time && data.daily.time.length){
-      return { code: data.daily.weathercode[0], tMax: Math.round(data.daily.temperature_2m_max[0]) };
+    if(data && data.hourly && data.hourly.time && data.hourly.time.length){
+      const startHour = SESSION_WEATHER_HOUR[day] ?? 12;
+      const n = data.hourly.time.length;
+      let startIdx = data.hourly.time.indexOf(`${dateISO}T${String(startHour).padStart(2,"0")}:00`);
+      if(startIdx < 0) startIdx = Math.min(startHour, n-1); // fallback: same-index hour
+      const endIdx = Math.min(startIdx + 2, n-1); // ~3-hour window covering the shoot
+      let worstCode = data.hourly.weathercode[startIdx], worstSeverity = -1, tempSum = 0, tempCount = 0;
+      for(let i=startIdx; i<=endIdx; i++){
+        const c = data.hourly.weathercode[i];
+        const sev = codeSeverity(c);
+        if(sev > worstSeverity){ worstSeverity = sev; worstCode = c; }
+        const t = data.hourly.temperature_2m[i];
+        if(typeof t === "number"){ tempSum += t; tempCount++; }
+      }
+      return { code: worstCode, tMax: Math.round(tempCount ? tempSum/tempCount : data.hourly.temperature_2m[startIdx]) };
     }
     return null;
   }catch(e){
-    console.error("weather fetch failed", dateISO, e);
+    console.error("weather fetch failed", dateISO, day, e);
     return null;
   }
 }
-function ensureWeather(dateISO){
-  if(state.weatherCache[dateISO] !== undefined) return;
-  state.weatherCache[dateISO] = "loading";
-  fetchWeatherForDate(dateISO).then(w=>{
-    state.weatherCache[dateISO] = w; // null on failure — cached so we don't hammer retries
+function ensureWeather(dateISO, day){
+  const key = `${dateISO}_${day}`;
+  if(state.weatherCache[key] !== undefined) return;
+  state.weatherCache[key] = "loading";
+  fetchWeatherForSession(dateISO, day).then(w=>{
+    state.weatherCache[key] = w; // null on failure — cached so we don't hammer retries
     render();
   });
 }
-function weatherChipHtml(dateISO){
-  ensureWeather(dateISO);
-  const w = state.weatherCache[dateISO];
-  if(w === "loading") return `⏳ <span style="font-size:11px;">loading</span>`;
-  if(!w) return `— <span style="font-size:11px;">n/a</span>`;
-  return `${weatherIcon(w.code)} ${w.tMax}°C`;
+function weatherChipHtml(dateISO, day){
+  ensureWeather(dateISO, day);
+  const w = state.weatherCache[`${dateISO}_${day}`];
+  if(w === "loading") return `\u23f3 <span style="font-size:11px;">loading</span>`;
+  if(!w) return `\u2014 <span style="font-size:11px;">n/a</span>`;
+  return `${weatherIcon(w.code)} ${w.tMax}\u00b0C`;
 }
 
 
@@ -826,7 +861,7 @@ function renderDraw(){
       <div class="s"><div class="n">${sel.registrations.length}</div><div class="l">Registered</div></div>
       <div class="s"><div class="n">${drawn ? Object.keys(sel.assignments||{}).length : "—"}</div><div class="l">Assigned</div></div>
       <div class="s"><div class="n">${status}</div><div class="l">Status</div></div>
-      <div class="s"><div class="n" style="font-size:16px">${weatherChipHtml(sel.dateISO)}</div><div class="l">Forecast</div></div>
+      <div class="s"><div class="n" style="font-size:16px">${weatherChipHtml(sel.dateISO, sel.day)}</div><div class="l">Forecast</div></div>
     </div>
     <div class="muted" style="margin-bottom:4px">Scheduled draw ${fmtDateTime(drawDateTime(sel))} · Registration ${isRegistrationOpen(sel)?"closes":"closed"} ${fmtDateTime(registrationCloseTime(sel))}${sel.forceOpen && isPastCloseTime(sel) ? " · Reopened for late requests" : ""}</div>
     <div class="muted" style="margin-bottom:10px">${sel.availableProperties ? `${sel.availableProperties.length} propert${sel.availableProperties.length===1?"y":"ies"} available this weekend` : "No property list saved for this weekend — showing all active properties"}</div>
@@ -1159,7 +1194,7 @@ function renderResults(){
   return `
   ${isLocked ? `
   <div class="card">
-    <h2>Log your bag <span class="muted" style="font-weight:400;font-size:13px">· ${sel.weather ? `${weatherIcon(sel.weather.code)} ${sel.weather.tMax}°C on shoot day` : weatherChipHtml(sel.dateISO)}</span></h2>
+    <h2>Log your bag <span class="muted" style="font-weight:400;font-size:13px">· ${sel.weather ? `${weatherIcon(sel.weather.code)} ${sel.weather.tMax}°C on shoot day` : weatherChipHtml(sel.dateISO, sel.day)}</span></h2>
     <p class="muted">Only shooters who were in this session can log a count. Already-logged names show a ✓ — logging again overwrites your previous entry.</p>
     <label>Your name</label>
     <select id="bagName"><option value="">— Select your name —</option>${nameOpts}</select>
@@ -1178,7 +1213,7 @@ function renderResults(){
   ${standCard}
 
   <div class="card">
-    <h2>Results <span class="muted" style="font-weight:400;font-size:13px">· ${sel.weather ? `${weatherIcon(sel.weather.code)} ${sel.weather.tMax}°C` : weatherChipHtml(sel.dateISO)}</span></h2>
+    <h2>Results <span class="muted" style="font-weight:400;font-size:13px">· ${sel.weather ? `${weatherIcon(sel.weather.code)} ${sel.weather.tMax}°C` : weatherChipHtml(sel.dateISO, sel.day)}</span></h2>
     <select id="resultsSessionSel">${options}</select>
     ${refreshBarHtml(true)}
     <div class="muted" style="margin:10px 0 4px">${isLocked?'Final — locked':'Draft — not yet locked'}</div>
@@ -1215,7 +1250,7 @@ async function submitBag(){
     target.bags[name] = counts;
     // Stamp the actual weather for this shoot day, once, the first time anyone logs a bag
     if(!target.weather){
-      const w = await fetchWeatherForDate(target.dateISO);
+      const w = await fetchWeatherForSession(target.dateISO, target.day);
       if(w) target.weather = w;
     }
     await saveSession(target);
@@ -1241,6 +1276,37 @@ async function updateOwnStand(){
   await saveSession(target);
   toast(`Updated ${name.split(" (")[0]}'s stand to ${prop} · Stand ${stand}.`);
   state.selectedStandName = name;
+  render();
+}
+// Someone who shot a session but never made it into the draw — added late, or
+// simply skipped. Re-reads the session first so two people doing this at once
+// don't clobber each other, and refuses a stand another hunter already holds.
+async function addOmittedShooter(){
+  const sel = state.sessions[state.omittedSessionId];
+  if(!sel) return;
+  const nameSel = document.getElementById("omittedName");
+  const name = nameSel ? nameSel.value : "";
+  if(!name){ toast("Select a name first."); return; }
+  const propSel = document.getElementById("omittedProp");
+  const standSel = document.getElementById("omittedStand");
+  const property = propSel ? propSel.value : "";
+  const stand = standSel ? standSel.value : "";
+  if(property && !stand){ toast("Pick a stand too, or clear the property to add with no stand."); return; }
+  const fresh = await sget("session:"+sel.id);
+  const target = fresh || sel;
+  target.order = target.order || [];
+  if(target.order.includes(name)){ toast("Already in this session."); render(); return; }
+  if(property && stand){
+    const clash = Object.values(target.assignments||{}).some(a=>a && a.property===property && String(a.stand)===String(stand));
+    if(clash){ toast(`Stand ${stand} at ${property} is already taken \u2014 pick another.`); return; }
+    target.assignments = target.assignments || {};
+    target.assignments[name] = {property, stand: String(stand)};
+  }
+  target.order.push(name);
+  target.registrations = target.registrations || [];
+  if(!target.registrations.includes(name)) target.registrations.push(name);
+  await saveSession(target);
+  toast(`Added ${name.split(" (")[0]} to this session${property && stand ? ` \u2014 ${property}, Stand ${stand}` : ""}.`);
   render();
 }
 async function releaseStand(){
@@ -1316,7 +1382,7 @@ function allStatRecords(){
         if(n>0){ const k = normSpecies(sp); counts[k] = (counts[k]||0)+n; }
       });
       const a = assignments[name];
-      const rec = {date:s.dateISO, day:s.day, wk:s.weekendLabel, shooter:name, prop:a?a.property:"", stand:a?String(a.stand):"", counts, dns:!!notShooting[name], src:"live"};
+      const rec = {date:s.dateISO, day:s.day, wk:s.weekendLabel, shooter:name, prop:a?a.property:"", stand:a?String(a.stand):"", counts, dns:!!notShooting[name], src:"live", reported:!!logged};
       if(histKeys[key]){
         if(logged) (liveOverride[key] = liveOverride[key]||[]).push(rec);
         // not logged in the app — the workbook record stands
@@ -1337,7 +1403,7 @@ function allStatRecords(){
     if(r[6]) counts["BALDPATE"] = r[6];
     if(r[7]) counts["WHITE WING"] = r[7];
     if(r[8]) counts["PALOMA"] = r[8];
-    out.push({date:r[0], day:r[1], wk:r[2], shooter:r[3], prop:r[4], stand:String(r[5]||""), counts, dns:!!r[9], est:!!r[10], src:"hist"});
+    out.push({date:r[0], day:r[1], wk:r[2], shooter:r[3], prop:r[4], stand:String(r[5]||""), counts, dns:!!r[9], est:!!r[10], src:"hist", reported:null});
   });
   return out.concat(liveExtra);
 }
@@ -1361,6 +1427,104 @@ function filteredStats(){
     if(f.shooter!=="ALL" && r.shooter!==f.shooter) return false;
     return true;
   });
+}
+
+// ---------- reporting rate ----------
+// Same filters as filteredStats(), but keeps "did not shoot" rows: a shooter who
+// ticked did-not-shoot HAS reported, so they belong in the denominator (and the
+// numerator) even though they contribute no birds.
+function filteredStatsAll(){
+  const f = state.statsFilter;
+  return allStatRecords().filter(r=>{
+    if(f.year!=="ALL" && recYear(r)!==f.year) return false;
+    if(f.wk!=="ALL" && r.wk!==f.wk) return false;
+    if(f.prop!=="ALL" && r.prop!==f.prop) return false;
+    if(f.stand!=="ALL" && String(r.stand)!==f.stand) return false;
+    if(f.shooter!=="ALL" && r.shooter!==f.shooter) return false;
+    return true;
+  });
+}
+// reported === null -> historic workbook row. The workbook never recorded who
+// reported, so those rows sit outside the rate entirely rather than counting as
+// misses (which would show every past season at 0%).
+function reportingSummary(recs){
+  const t = recs.filter(r=>r.reported===true || r.reported===false);
+  const drawn = t.length;
+  const reported = t.filter(r=>r.reported).length;
+  return {drawn, reported, missing:drawn-reported, pct: drawn ? Math.round(reported/drawn*100) : null};
+}
+function pctTone(p){ return p>=90 ? "#2E7D32" : (p>=70 ? "#B08D57" : "#B3261E"); }
+function pctBarHtml(label, reported, drawn){
+  const pct = drawn ? Math.round(reported/drawn*100) : 0;
+  return `<div style="margin-bottom:10px">
+    <div class="row" style="margin-bottom:3px"><b style="flex:1;font-size:13px">${esc(String(label))}</b>
+      <span class="muted" style="flex:0 0 auto">${reported}/${drawn} &middot; <b style="color:${pctTone(pct)}">${pct}%</b></span></div>
+    <div style="background:var(--bg);border-radius:6px;overflow:hidden;height:9px;">
+      <div style="background:${pctTone(pct)};width:${pct}%;height:100%;"></div>
+    </div>
+  </div>`;
+}
+function reportingCardHtml(recsAll){
+  const o = reportingSummary(recsAll);
+  if(o.drawn === 0){
+    return `<div class="card"><h2>Log reporting</h2>
+      <div class="empty">No app-run sessions in this selection.<br>Reporting is only tracked for draws run and locked in the app &mdash; the historic workbook doesn't record who reported.</div></div>`;
+  }
+  const missing = recsAll.filter(r=>r.reported===false)
+    .sort((a,b)=> b.date.localeCompare(a.date) || b.day.localeCompare(a.day) || a.shooter.localeCompare(b.shooter));
+  const missRow = r => `<div class="list-row"><span>${esc(r.shooter)}</span><span class="muted">${esc(r.prop||"\u2014")}${r.stand?` &middot; ${esc(r.stand)}`:""}</span></div>`;
+  const scope = state.reportScope === "all" ? "all" : "latest";
+  let chaseHtml;
+  if(!missing.length){
+    chaseHtml = `<p class="muted" style="margin:10px 0 0">Everyone drawn in this selection logged a result.</p>`;
+  } else {
+    const groups = [];
+    const seen = {};
+    missing.forEach(r=>{
+      const k = `${r.date}|${r.day}`;
+      if(!seen[k]){ seen[k] = {date:r.date, day:r.day, wk:r.wk, rows:[]}; groups.push(seen[k]); }
+      seen[k].rows.push(r);
+    });
+    // Only offer the toggle when there is more than one session's worth to see.
+    const scopeRow = groups.length > 1 ? `<div class="scope-row">
+      <label class="scope-opt ${scope==="latest"?"checked":""}">
+        <input type="radio" name="reportScope" class="reportScope" value="latest" ${scope==="latest"?"checked":""}>
+        <span>Latest session (${groups[0].rows.length})</span></label>
+      <label class="scope-opt ${scope==="all"?"checked":""}">
+        <input type="radio" name="reportScope" class="reportScope" value="all" ${scope==="all"?"checked":""}>
+        <span>All outstanding (${missing.length})</span></label>
+    </div>` : "";
+    const CAP = 12; // sessions listed at once in the full view
+    const shown = scope==="all" ? groups.slice(0, CAP) : groups.slice(0, 1);
+    const body = shown.map(g=>`
+      <div class="section-divider">${dayLabel(g.day)} &middot; ${esc(g.wk)} (${fmtDate(g.date)}) &mdash; ${g.rows.length} outstanding</div>
+      ${g.rows.map(missRow).join("")}`).join("");
+    let footer = "";
+    if(scope==="all" && groups.length > CAP){
+      const rest = groups.slice(CAP).reduce((a,g)=>a+g.rows.length,0);
+      footer = `<p class="muted" style="margin:8px 0 0">${rest} more across ${groups.length-CAP} earlier sessions \u2014 narrow the filters above to reach them.</p>`;
+    } else if(scope!=="all" && groups.length > 1){
+      footer = `<p class="muted" style="margin:8px 0 0">${missing.length-groups[0].rows.length} more still outstanding in earlier sessions in this selection.</p>`;
+    }
+    chaseHtml = `<div class="section-divider">Still to report</div>${scopeRow}${body}${footer}`;
+  }
+  const bySh = {};
+  recsAll.filter(r=>r.reported===true || r.reported===false).forEach(r=>{
+    const sh = bySh[r.shooter] = bySh[r.shooter] || {d:0, rep:0};
+    sh.d++; if(r.reported) sh.rep++;
+  });
+  const shEntries = Object.entries(bySh).filter(([,v])=>v.d>=2)
+    .sort((a,b)=> (a[1].rep/a[1].d)-(b[1].rep/b[1].d) || b[1].d-a[1].d).slice(0,12);
+  const shHtml = shEntries.length ? `<div class="section-divider">Reporting rate by shooter (2+ draws, weakest first)</div>
+    ${shEntries.map(([n,v])=>pctBarHtml(n, v.rep, v.d)).join("")}` : "";
+  return `<div class="card"><h2>Log reporting</h2>
+    <div class="stat-box">
+      <div class="s"><div class="n" style="color:${pctTone(o.pct)}">${o.pct}%</div><div class="l">Reported</div></div>
+      <div class="s"><div class="n">${o.reported}/${o.drawn}</div><div class="l">Logs in</div></div>
+      <div class="s"><div class="n">${o.missing}</div><div class="l">Outstanding</div></div>
+    </div>
+    ${chaseHtml}${shHtml}
+  </div>`;
 }
 
 function statBarListHtml(entries, unit){
@@ -1442,6 +1606,7 @@ function renderDashboard(){
   </div>`;
 
   const recs = filteredStats();
+  const recsAll = filteredStatsAll();
   const withBirds = recs.filter(r=>recTotal(r)>0);
   const total = withBirds.reduce((a,r)=>a+recTotal(r),0);
   const uniqShooters = new Set(recs.map(r=>r.shooter)).size;
@@ -1524,12 +1689,16 @@ function renderDashboard(){
 
   // ---- season log: one row per session in the current selection ----
   const sessMap = {};
-  recs.forEach(r=>{
+  recsAll.forEach(r=>{
     const k = `${r.date}|${r.day}`;
-    if(!sessMap[k]) sessMap[k] = {date:r.date, day:r.day, wk:r.wk, shooters:0, birds:0, est:false};
-    sessMap[k].shooters += 1;
+    if(!sessMap[k]) sessMap[k] = {date:r.date, day:r.day, wk:r.wk, shooters:0, birds:0, est:false, drawn:0, reported:0};
+    if(!r.dns) sessMap[k].shooters += 1;
     sessMap[k].birds += recTotal(r);
     if(r.est) sessMap[k].est = true;
+    if(r.reported===true || r.reported===false){
+      sessMap[k].drawn += 1;
+      if(r.reported) sessMap[k].reported += 1;
+    }
   });
   const sessList = Object.values(sessMap).sort((a,b)=> b.date.localeCompare(a.date) || b.day.localeCompare(a.day));
   const LOG_CAP = 30;
@@ -1539,27 +1708,32 @@ function renderDashboard(){
   const logRows = shownSess.map(s=>{
     const w = liveWeather[`${s.date}|${s.day}`];
     const wHtml = w ? `${weatherIcon(w.code)} ${w.tMax}\u00b0C` : weatherChipHtml(s.date, s.day);
-    return `<tr><td style="white-space:nowrap">${fmtDateY(s.date)}</td><td>${dayLabel(s.day)} \u00b7 ${esc(s.wk)}</td><td>${s.shooters}</td><td style="white-space:nowrap">${wHtml}</td><td><b>${s.est?"~":""}${s.birds}</b></td></tr>`;
+    const rpHtml = s.drawn
+      ? `<b style="color:${pctTone(Math.round(s.reported/s.drawn*100))}">${s.reported}/${s.drawn}</b>`
+      : `<span class="muted">\u2014</span>`;
+    return `<tr><td style="white-space:nowrap">${fmtDateY(s.date)}</td><td>${dayLabel(s.day)} \u00b7 ${esc(s.wk)}</td><td>${s.shooters}</td><td style="white-space:nowrap">${wHtml}</td><td style="white-space:nowrap">${rpHtml}</td><td><b>${s.est?"~":""}${s.birds}</b></td></tr>`;
   }).join("");
   const seasonLogCard = sessList.length ? `<div class="card"><h2>Season log</h2>
     ${sessList.length > LOG_CAP ? `<p class="muted">Most recent ${LOG_CAP} of ${sessList.length} sessions \u2014 narrow the filters above to see earlier ones.</p>` : ""}
-    <table><thead><tr><th>Date</th><th>Session</th><th>Shooters</th><th>Weather</th><th>Birds</th></tr></thead><tbody>${logRows}</tbody></table>
+    <table><thead><tr><th>Date</th><th>Session</th><th>Shooters</th><th>Weather</th><th>Logged</th><th>Birds</th></tr></thead><tbody>${logRows}</tbody></table>
+    <p class="muted" style="margin:8px 0 0">\u201cLogged\u201d counts how many of the shooters drawn that session came back and recorded a result. A dash means the session came from the historic workbook, which never tracked it.</p>
   </div>` : "";
 
   const exportCard = `<div class="card">
     <p class="muted">Exports exactly what the filters above are showing — one row per shooter per session, live app results merged with the historic workbook (app results win where both exist).</p>
-    <div class="btn-row"><button class="btn-ghost" id="exportSeasonCsv" style="width:100%">Export filtered CSV (${recs.length} rows)</button></div>
+    <div class="btn-row"><button class="btn-ghost" id="exportSeasonCsv" style="width:100%">Export filtered CSV (${recsAll.length} rows)</button></div>
   </div>`;
 
-  return filterCard + summaryCard + trendCard + breakdownCard + shooterCard + seasonLogCard + exportCard;
+  return filterCard + summaryCard + trendCard + breakdownCard + shooterCard
+       + seasonLogCard + reportingCardHtml(recsAll) + exportCard;
 }
 
 function exportSeasonCsv(){
-  const recs = filteredStats().slice().sort((a,b)=> a.date.localeCompare(b.date) || a.day.localeCompare(b.day) || a.shooter.localeCompare(b.shooter));
-  let csv = "Date,Weekend,Session,Shooter,Property,Stand,Total,Breakdown,Source\n";
+  const recs = filteredStatsAll().slice().sort((a,b)=> a.date.localeCompare(b.date) || a.day.localeCompare(b.day) || a.shooter.localeCompare(b.shooter));
+  let csv = "Date,Weekend,Session,Shooter,Property,Stand,Total,Breakdown,Source,Reported\n";
   recs.forEach(r=>{
-    const breakdown = Object.entries(r.counts).map(([sp,n])=>`${sp} ${n}`).join(" · ");
-    csv += `${r.date},${r.wk},${dayLabel(r.day)},"${r.shooter.replace(/"/g,'""')}","${(r.prop||"").replace(/"/g,'""')}",${r.stand||""},${recTotal(r)},"${breakdown}",${r.est?"Estimated (2024 stand avg)":(r.src==="live"?"App":"Workbook")}\n`;
+    const breakdown = r.dns ? "Did not shoot" : Object.entries(r.counts).map(([sp,n])=>`${sp} ${n}`).join(" · ");
+    csv += `${r.date},${r.wk},${dayLabel(r.day)},"${r.shooter.replace(/"/g,'""')}","${(r.prop||"").replace(/"/g,'""')}",${r.stand||""},${recTotal(r)},"${breakdown}",${r.est?"Estimated (2024 stand avg)":(r.src==="live"?"App":"Workbook")},${(r.reported===true||r.reported===false)?(r.reported?"Yes":"No"):"n/a"}\n`;
   });
   const blob = new Blob([csv], {type:"text/csv"});
   const url = URL.createObjectURL(blob);
@@ -1571,6 +1745,8 @@ function exportSeasonCsv(){
 
 // stats-explorer controls (delegated — no per-render wiring needed)
 document.addEventListener("change", (e)=>{
+  const scopeRadio = e.target.closest(".reportScope");
+  if(scopeRadio){ state.reportScope = scopeRadio.value; render(); return; }
   const sel = e.target.closest(".statsFilter");
   if(!sel) return;
   const f = state.statsFilter;
@@ -1661,6 +1837,44 @@ function renderSetup(){
       </div>
       </div>
     `).join("")}
+  </div>
+
+  <div class="card">
+    <h2>Add a shooter who was missed</h2>
+    <p class="muted">For someone who shot a session but wasn't in the original draw — added late, or the draw skipped them. Optionally assign a property and stand; leave blank to just log them in with no stand recorded.</p>
+    ${(()=>{
+      const drawn = sessionsSorted().filter(s=>s.order && s.order.length);
+      if(!drawn.length) return `<div class="empty">No draws have been run yet.</div>`;
+      const os = state.omittedSessionId && state.sessions[state.omittedSessionId] && (state.sessions[state.omittedSessionId].order||[]).length
+        ? state.sessions[state.omittedSessionId] : drawn[drawn.length-1];
+      state.omittedSessionId = os.id;
+      const sessOpts = drawn.map(s=>`<option value="${s.id}" ${s.id===os.id?"selected":""}>${dayLabel(s.day)} · ${esc(s.weekendLabel)} · ${fmtDate(s.dateISO)}</option>`).join("");
+      const missingRoster = state.roster.filter(m=>!(os.order||[]).includes(m.name))
+        .slice().sort((a,b)=>a.name.localeCompare(b.name));
+      const missingOpts = missingRoster.map(m=>`<option value="${escAttr(m.name)}">${esc(m.name)}${m.junior?" (Jr)":""}</option>`).join("");
+      const omittedTaken = {};
+      Object.values(os.assignments||{}).forEach(a=>{
+        if(a && a.property){ (omittedTaken[a.property] = omittedTaken[a.property]||new Set()).add(String(a.stand)); }
+      });
+      window.__omittedTaken = omittedTaken;
+      const availableSet = os.availableProperties ? new Set(os.availableProperties) : null;
+      const propOpts = state.properties
+        .filter(p => p.active && (!availableSet || availableSet.has(p.name)))
+        .map(p=>`<option value="${escAttr(p.name)}">${esc(p.name)} (${standList(p).length})</option>`).join("");
+      return `
+        <label>Session</label>
+        <select id="omittedSessionSel">${sessOpts}</select>
+        <label style="margin-top:8px">Name</label>
+        ${missingRoster.length ? `
+          <select id="omittedName"><option value="">— Select name —</option>${missingOpts}</select>
+          <label style="margin-top:8px">Property (optional)</label>
+          <select id="omittedProp"><option value="">— No stand —</option>${propOpts}</select>
+          <label style="margin-top:8px">Stand (optional)</label>
+          <select id="omittedStand"><option value="">Stand…</option></select>
+          <div class="btn-row"><button class="btn-brass btn-small" id="addOmitted" style="width:100%">Add to this session</button></div>
+        ` : `<p class="muted">Everyone in the roster is already in this session.</p>`}
+      `;
+    })()}
   </div>
 
   <div class="card">
@@ -2147,6 +2361,25 @@ function attachHandlers(){
       }
     });
   }
+  const omittedProp = document.getElementById("omittedProp");
+  if(omittedProp){
+    omittedProp.addEventListener("change", ()=>{
+      const standSel = document.getElementById("omittedStand");
+      const propName = omittedProp.value;
+      const prop = state.properties.find(p=>p.name===propName);
+      standSel.innerHTML = `<option value="">Stand\u2026</option>`;
+      if(prop){
+        const takenSet = (window.__omittedTaken && window.__omittedTaken[propName]) || new Set();
+        standList(prop).forEach(sd=>{
+          if(!takenSet.has(sd)) standSel.innerHTML += `<option value="${escAttr(sd)}">${esc(sd)}</option>`;
+        });
+      }
+    });
+  }
+  const addOmittedBtn = document.getElementById("addOmitted");
+  if(addOmittedBtn) addOmittedBtn.addEventListener("click", addOmittedShooter);
+  const omittedSessionSel = document.getElementById("omittedSessionSel");
+  if(omittedSessionSel) omittedSessionSel.addEventListener("change", ()=>{ state.omittedSessionId = omittedSessionSel.value; render(); });
   const updateStandBtn = document.getElementById("updateStand");
   if(updateStandBtn) updateStandBtn.addEventListener("click", updateOwnStand);
   const releaseStandBtn = document.getElementById("releaseStand");
